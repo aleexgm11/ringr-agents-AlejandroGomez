@@ -37,7 +37,7 @@ class CallSession:
     async def run(self) -> CallOutcome:
         config = self._deps.config
         transport = self._deps.transport_factory(self._ctx.call_id)
-        await transport.open()
+        await transport.open() # TODO es el bot marcando
         try:
             while True:
                 event = await transport.next_event()

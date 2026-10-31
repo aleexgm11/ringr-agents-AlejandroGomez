@@ -61,3 +61,8 @@ class CallResult(models.Model):
     duration_s = models.FloatField()
     transcript = models.TextField(blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=['call'], name='one_result_per_call'),
+        ]

@@ -21,6 +21,7 @@ class SimulatedNetworkMiddleware:
         network = settings.SIMULATED_NETWORK
         time.sleep(network['latency_ms'] / 1000)
         response = self.get_response(request)
+        # TODO que explique esto mejor, no entiendo bien que hace. 
         if request.method == 'POST' and self._rng.random() < network['lost_response_rate']:
             time.sleep((network['client_timeout_ms'] + 500) / 1000)
         return response
