@@ -1,12 +1,15 @@
 import threading
 from collections.abc import Callable
+from datetime import timedelta
 from functools import partial
+from typing import Any
 from unittest import mock
 
 import pytest
 from django.db import connection
 from django.http import HttpResponseBase
 from django.test import Client
+from django.utils import timezone
 
 from calls.models import Call, CallResult, Campaign, CampaignOwnership, Contact, ScriptStep, Tenant
 
@@ -44,6 +47,8 @@ def test_result_is_stored(client: Client, call: Call) -> None:
 
     assert response.status_code == 200
     assert CallResult.objects.get(call=call).outcome == 'completed'
+
+# TESTS FOR RACE CONDITIONS, problem 2
 
 RESULT = {'outcome': 'completed', 'duration_s': 95.0, 'transcript': 'user: Hello'}
 
@@ -135,3 +140,36 @@ def test_results_of_one_tenant_at_the_same_time_add_up(call: Call) -> None:
     run_in_parallel(*(partial(report, c) for c in calls))
 
     assert minutes_used(call) == 8 * 2
+
+# TESTS FOR PETITION LAG, problem 1
+def add_history(call: Call, outcomes: list[str]) -> None:
+    """Finished calls for the same contact, the first outcome being the most recent."""
+    for days_ago, outcome in enumerate(outcomes, start=1):
+        previous = Call.objects.create(
+            campaign=call.campaign,
+            contact=call.contact,
+            status=Call.Status.FINISHED,
+            created_at=timezone.now() - timedelta(days=days_ago),
+        )
+        CallResult.objects.create(call=previous, outcome=outcome, duration_s=60)
+
+
+def test_context_queries_do_not_grow_with_history(
+    client: Client, call: Call, django_assert_num_queries: Any
+) -> None:
+    with django_assert_num_queries(4):
+        client.get(f'/calls/{call.id}/context')
+
+    add_history(call, ['completed'] * 20)
+
+    with django_assert_num_queries(4):
+        client.get(f'/calls/{call.id}/context')
+
+
+def test_context_history_is_the_latest_finished_calls(client: Client, call: Call) -> None:
+    add_history(call, ['user_hangup'] + ['completed'] * 24)
+
+    history = client.get(f'/calls/{call.id}/context').json()['history']
+
+    assert len(history) == 20
+    assert history[0]['outcome'] == 'user_hangup'

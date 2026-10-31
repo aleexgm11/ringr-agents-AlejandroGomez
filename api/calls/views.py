@@ -6,43 +6,48 @@ import uuid
 from typing import Any
 
 from django.db import transaction
-from django.db.models import F
+from django.db.models import F, OuterRef, Subquery
 from django.http import HttpRequest, JsonResponse
 from django.shortcuts import get_object_or_404
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_GET, require_POST
 
-from calls.models import Call, CallResult, Tenant
+from calls.models import Call, CallResult, CampaignOwnership, ScriptStep, Tenant
 
 HISTORY_SIZE = 20
 
-
 @require_GET
 def call_context(request: HttpRequest, call_id: uuid.UUID) -> JsonResponse:
-    """Everything the runtime needs to start a call: tenant, contact, script and history."""
-    call = get_object_or_404(Call, pk=call_id)
-    owner = call.campaign.ownerships.get()
-    previous_calls = Call.objects.filter(
-        contact=call.contact, status=Call.Status.FINISHED
-    ).order_by('-created_at')[:HISTORY_SIZE]
-    history = []
+    """Everything the runtime needs to start a call: tenant, contact, script and history.
+
+    Prefetches the last HISTORY_SIZE results to evict more calls to the database.
+    """
+    call = get_object_or_404(Call.objects.select_related('contact'), pk=call_id)
+    owner = CampaignOwnership.objects.get(campaign_id=call.campaign_id)
+    first_outcome = (
+        CallResult.objects.filter(call=OuterRef('pk')).order_by('pk').values('outcome')[:1]
+    )
+
     # TODO puede ser que aqui haya un punto de mejora
-    # En vez de una llamada por 
-    for previous in previous_calls:  
-        result = previous.results.first()
-        if result is not None:
-            history.append({'outcome': result.outcome, 'created_at': previous.created_at})
+    # En vez de una peticion por cada llamada, se podria hacer una sola peticion.
+    previous_calls = (
+        Call.objects.filter(contact_id=call.contact_id, status=Call.Status.FINISHED)
+        .annotate(outcome=Subquery(first_outcome))
+        .order_by('-created_at')
+        .values('outcome', 'created_at')[:HISTORY_SIZE]
+    )
 
     return JsonResponse(
         {
             'call_id': str(call.id),
             'tenant': {'id': owner.tenant_id},
             'contact': {'name': call.contact.name, 'phone': call.contact.phone},
-            'script': [
-                {'order': step.order, 'text': step.text}
-                for step in call.campaign.steps.order_by('order')
-            ],
-            'history': history,
+            'script': list(
+                ScriptStep.objects.filter(campaign_id=call.campaign_id)
+                .order_by('order')
+                .values('order', 'text')
+            ),
+            'history': [p for p in previous_calls if p['outcome'] is not None],
         }
     )
 
