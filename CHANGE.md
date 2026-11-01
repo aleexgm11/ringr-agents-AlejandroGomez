@@ -219,10 +219,31 @@ deterministas e independientes de Docker. La parte de la API se prueba aparte, c
 
 ## Acerca del diseño de datos
 
-La funcionalidad de reintento de llamadas esconde una posible mejora. Con el diseño actual los clientes se clasifican por tipos cerrados con ciertas caracteristicas cada uno, como el historial de llamadas previas. Al ser relacional, si se quiere añadir una nueva caracteristica se tiene que cambiar la tabla ampliando con los nuevos campos y determinando quien tiene cierta caracteristica o no. Otro caso puede ser si una nueva empresa tiene una promocion con una funcionalidad especifica, no se podria implementar sin cambiar la base de datos. Por tanto, esta parte de Tenants, campañas, etc. (negocio) Podria esta en una base No-SQL que destaca por versatilidad y meterse en un modelo hibrido con ambos. 
+La funcionalidad de reintento de llamadas esconde una posible mejora. Con el diseño actual, cada tenant tiene sus propios valores para las reglas del contrato (acme 3 intentos, beta 2...), y dar de alta un cliente con otros valores no necesita cambiar nada. Pero cada *tipo* de regla nuevo sí obliga a cambiar la tabla: los reintentos han añadido cuatro columnas a `Tenant`. Si mañana un cliente pide "no llamar en festivos" y otro tiene una promoción con una funcionalidad específica, `Tenant` seguirá creciendo con campos que solo usan algunos clientes, y cada uno pasará por una migración.
 
-`Punto fuerte en contra`: la consistencia y la complejidad de las consultas cruzadas, si se hace en tiempo real el cruce entre ambas bases de datos crea mucho lag en las respuestas. Puede ser buena solucion implementar una capa intermedia en memoria como Redis donde se guarde en cache durante las campañas. Aumenta el coste computacional pero ofrece muy buena escalabilidad a diferentes necedisades 
+Una opción sería llevar la parte de negocio (tenants, campañas) a una base de datos NoSQL, que destaca por su versatilidad, en un modelo híbrido con la relacional. La descarto: las garantías de los problemas 2 y 3 dependen de tener todo en una sola base de datos transaccional. El resultado, los minutos y el reintento se guardan en una transacción; el contrato se lee en esa misma transacción; el horario y los reintentos están protegidos por restricciones del esquema; y `/context` se resuelve con JOINs en 4 consultas. Repartirlo entre dos bases de datos volvería a traer los fallos a medias del problema 2 y las consultas cruzadas lentas del problema 1. Una caché en memoria como Redis aliviaría el retraso, pero añadiría invalidaciones (¿cuándo se nota un cambio de contrato a mitad de campaña?) y un tercer sistema que operar, para datos que caben de sobra en una tabla.
 
-*SQL* -> Tenant (informacion basica como id, estado cuenta...), Calls, CallResult
+`Propuesta`: el modelo híbrido dentro de Postgres, con una columna `JSONB` en `Tenant` para lo que varía por cliente. Da la flexibilidad sin migraciones que buscaba NoSQL y mantiene las transacciones y los JOINs. Además se puede indexar (GIN), y la validación se recupera con un esquema en código (pydantic o un `TypedDict`). Por otro lado, la migración no es lo caro de una funcionalidad nueva (añadir una columna con un valor por defecto en Postgres es instantáneo): lo caro es el código que la aplica, y ese hay que desplegarlo igual con cualquier base de datos. Cuando una característica del JSON se generaliza, se convierte en columna.
 
-*NoSQL* -> Campaings, Tenant (caracteristicas del plan variable)
+*Columnas* -> lo que afecta a dinero o a la lógica central: facturación, contrato de reintentos, `Call`, `CallResult`
+
+*JSONB* -> lo opcional y distinto en cada cliente: promociones, características variables del plan
+
+## Acerca de la facturación
+
+La facturación se guarda como un contador: `Tenant.minutes_used` es un número al que cada resultado suma sus minutos. Esa fue la raíz del problema 2 donde el modelo deja tres huecos:
+
+- **No guarda el origen.** Si `minutes_used = 1.234`, no hay forma de saber qué llamadas suman esa cifra. Recalcularla desde `CallResult`, como queda pendiente en el problema 2, seria muy costoso.
+- **No tiene periodo.** Es un total acumulado desde siempre, pero las facturas son mensuales. Con este campo no se puede responder cuanto se facturo a cada cliente en un periodo concreto.
+- **Una regla nueva reescribe el pasado.** En el problema 3, `no_answer` pasa a facturar 0 minutos. Si se recalcula con esa regla, las llamadas `no_answer` antiguas, que sí se cobraron, saldrían a 0 y no cuadrarían con las facturas ya emitidas.
+
+`Propuesta`: guardar los minutos facturados en cada resultado, con una columna `CallResult.billed_minutes` que se fija al insertar con `billed_minutes(payload)`. Cada minuto queda ligado a la llamada que lo generó, así que una factura se puede justificar línea a línea. La facturación de un periodo pasa a ser una consulta (`SUM(billed_minutes)` de los resultados del tenant en ese mes), y un cambio de regla solo afecta a los resultados nuevos, porque cada uno conserva lo que se facturó en su momento. Además, con la restricción `one_result_per_call` ya existente, cada llamada se factura una sola vez por construcción.
+`Propuesta`: La idea es guardar los minutos facturados en `CallResult.billed_minutes` al insertar mediante `billed_minutes(payload)`. Esto deja cada minuto ligado a su llamada para poder detallar la factura línea a línea, hace que facturar el mes sea una consulta simple de `SUM(billed_minutes)` por tenant y evita que los cambios de reglas rompan el historial. Además, con la restricción `one_result_per_call` ya nos aseguramos de que ninguna llamada se facture dos veces.
+
+`minutes_used` puede quedarse como caché para las lecturas rápidas, con una conciliación periódica que compruebe `minutes_used == SUM(billed_minutes)` donde avise si son diferentes. Esa alarma habría detectado el problema 2 de forma automatica. El coste es pequeño: una columna, una migración de datos que rellene los resultados existentes y una línea en `call_result`.
+
+Esto añadiria mucha mas riqueza a los datos de facturacion, pudiendo hacer informes o una reconstruccion para detectar problemas para cada cliente sin romper codigo actual
+
+*Antes* -> un contador que solo dice cuánto, sin decir de dónde ni cuándo
+
+*Después* -> cada resultado registra lo que se facturó; el total y las facturas por periodo se calculan a partir de ahí
