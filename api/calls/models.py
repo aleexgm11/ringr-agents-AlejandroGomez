@@ -1,4 +1,5 @@
 import uuid
+from datetime import timedelta
 
 from django.db import models
 from django.utils import timezone
@@ -10,6 +11,27 @@ class Tenant(models.Model):
     system_prompt = models.TextField(default='')
     # Billed minutes, summed from every reported call result.
     minutes_used = models.PositiveIntegerField(default=0)
+
+    max_attempts = models.PositiveSmallIntegerField(default=1)
+    retry_delay = models.DurationField(default=timedelta(0))
+
+    calling_opens = models.TimeField(null=True, blank=True)
+    calling_closes = models.TimeField(null=True, blank=True)
+
+    class Meta:
+        # The calling hours must be either both null or both set, 
+        # and if set, opens must be before closes.
+        constraints = [
+            models.CheckConstraint(
+                check=models.Q(calling_opens__isnull=True, calling_closes__isnull=True)
+                | models.Q(
+                    calling_opens__isnull=False,
+                    calling_closes__isnull=False,
+                    calling_opens__lt=models.F('calling_closes'),
+                ),
+                name='calling_hours_together_and_ordered',
+            ),
+        ]
 
 
 class Campaign(models.Model):
@@ -46,6 +68,12 @@ class Call(models.Model):
     created_at = models.DateTimeField(default=timezone.now)
     # The dialer (another service) starts pending calls once this moment has passed.
     scheduled_at = models.DateTimeField(default=timezone.now)
+    # 1 for the first call to a contact, 2 for its first retry, and so on.
+    attempt = models.PositiveSmallIntegerField(default=1)
+    # The unanswered call this one retries. One-to-one, so a call is never retried twice.
+    retry_of = models.OneToOneField(
+        'self', on_delete=models.SET_NULL, null=True, blank=True, related_name='retry'
+    )
 
 
 class CallResult(models.Model):
@@ -54,6 +82,7 @@ class CallResult(models.Model):
         USER_HANGUP = 'user_hangup'
         TIMEOUT = 'timeout'
         ERROR = 'error'
+        NO_ANSWER = 'no_answer'
 
     call = models.ForeignKey(Call, on_delete=models.CASCADE, related_name='results')
     outcome = models.CharField(max_length=20, choices=Outcome.choices)

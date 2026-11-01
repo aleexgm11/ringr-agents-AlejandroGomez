@@ -1,6 +1,6 @@
 import threading
 from collections.abc import Callable
-from datetime import timedelta
+from datetime import datetime, time, timedelta
 from functools import partial
 from typing import Any
 from unittest import mock
@@ -12,6 +12,7 @@ from django.test import Client
 from django.utils import timezone
 
 from calls.models import Call, CallResult, Campaign, CampaignOwnership, Contact, ScriptStep, Tenant
+from calls.retries import CALLING_TZ
 
 pytestmark = pytest.mark.django_db
 
@@ -173,3 +174,82 @@ def test_context_history_is_the_latest_finished_calls(client: Client, call: Call
 
     assert len(history) == 20
     assert history[0]['outcome'] == 'user_hangup'
+
+# TESTS FOR RETRYING CALLS, feature
+ACME_CONTRACT = {
+    'max_attempts': 3,
+    'retry_delay': timedelta(minutes=30),
+    'calling_opens': time(9),
+    'calling_closes': time(21),
+}
+
+
+def sign_contract(call: Call, **contract: object) -> None:
+    Tenant.objects.filter(ownerships__campaign=call.campaign).update(**contract)
+
+
+def report_no_answer(client: Client, call: Call, at: datetime) -> HttpResponseBase:
+    with mock.patch('django.utils.timezone.now', return_value=at):
+        return post_result(client, call, outcome='no_answer', duration_s=0.001)
+
+
+def test_an_unanswered_call_is_not_billed(client: Client, call: Call) -> None:
+    response = report_no_answer(client, call, at=timezone.now())
+
+    assert response.status_code == 200
+    assert CallResult.objects.get(call=call).outcome == 'no_answer'
+    assert minutes_used(call) == 0
+
+
+def test_without_a_contract_an_unanswered_call_is_not_retried(client: Client, call: Call) -> None:
+    report_no_answer(client, call, at=timezone.now())
+
+    assert not Call.objects.filter(retry_of=call).exists()
+
+
+def test_an_unanswered_call_is_retried_once_the_wait_is_over(client: Client, call: Call) -> None:
+    sign_contract(call, **ACME_CONTRACT)
+
+    report_no_answer(client, call, at=datetime(2026, 11, 2, 10, 0, tzinfo=CALLING_TZ))
+
+    retry = Call.objects.get(retry_of=call)
+    assert (retry.campaign_id, retry.contact_id) == (call.campaign_id, call.contact_id)
+    assert retry.status == Call.Status.PENDING
+    assert retry.attempt == 2
+    assert retry.scheduled_at == datetime(2026, 11, 2, 10, 30, tzinfo=CALLING_TZ)
+
+
+def test_a_retry_that_would_fall_after_hours_waits_for_opening(client: Client, call: Call) -> None:
+    sign_contract(call, **ACME_CONTRACT)
+
+    report_no_answer(client, call, at=datetime(2026, 11, 2, 20, 45, tzinfo=CALLING_TZ))
+
+    retry = Call.objects.get(retry_of=call)
+    assert retry.scheduled_at == datetime(2026, 11, 3, 9, 0, tzinfo=CALLING_TZ)
+
+
+def test_the_last_attempt_is_not_retried(client: Client, call: Call) -> None:
+    sign_contract(call, **ACME_CONTRACT)
+    Call.objects.filter(pk=call.pk).update(attempt=3)
+
+    report_no_answer(client, call, at=datetime(2026, 11, 2, 10, 0, tzinfo=CALLING_TZ))
+
+    assert not Call.objects.filter(retry_of=call).exists()
+
+
+def test_a_repeated_no_answer_schedules_one_retry(client: Client, call: Call) -> None:
+    sign_contract(call, **ACME_CONTRACT)
+    at = datetime(2026, 11, 2, 10, 0, tzinfo=CALLING_TZ)
+
+    report_no_answer(client, call, at=at)
+    report_no_answer(client, call, at=at)
+
+    assert Call.objects.filter(retry_of=call).count() == 1
+
+
+def test_answered_calls_are_not_retried(client: Client, call: Call) -> None:
+    sign_contract(call, **ACME_CONTRACT)
+
+    post_result(client, call, outcome='user_hangup')
+
+    assert not Call.objects.filter(retry_of=call).exists()

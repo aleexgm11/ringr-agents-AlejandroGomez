@@ -2,7 +2,7 @@
 pending calls and, for the largest, a history of finished calls per contact."""
 
 import random
-from datetime import timedelta
+from datetime import time, timedelta
 from typing import Any
 
 from django.apps import apps
@@ -22,6 +22,21 @@ from calls.models import (
 
 # name, pending calls, finished calls per contact
 TENANTS = [('acme', 50, (0, 0)), ('beta', 250, (0, 0)), ('gamma', 700, (15, 20))]
+CONTRACTS: dict[str, dict[str, Any]] = {
+    'acme': {
+        'max_attempts': 3,
+        'retry_delay': timedelta(minutes=30),
+        'calling_opens': time(9),
+        'calling_closes': time(21),
+    },
+    'beta': {
+        'max_attempts': 2,
+        'retry_delay': timedelta(hours=2),
+        'calling_opens': time(10),
+        'calling_closes': time(20),
+    },
+    'gamma': {},  # the defaults: no retries
+}
 STEPS = [
     'Greet the contact and confirm you are speaking with the account holder.',
     'Explain the reason for the call and present the pending balance.',
@@ -44,7 +59,9 @@ class Command(BaseCommand):
                 cursor.execute(f'TRUNCATE {tables} RESTART IDENTITY CASCADE')
             for name, pending, history in TENANTS:
                 tenant = Tenant.objects.create(
-                    name=name, system_prompt=f'You call on behalf of {name}. Be brief and polite.'
+                    name=name, 
+                    system_prompt=f'You call on behalf of {name}. Be brief and polite.',
+                    **CONTRACTS[name]
                 )
                 campaign = Campaign.objects.create(name=f'{name} collections')
                 CampaignOwnership.objects.create(campaign=campaign, tenant=tenant)

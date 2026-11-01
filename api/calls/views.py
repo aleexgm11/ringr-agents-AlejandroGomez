@@ -9,10 +9,12 @@ from django.db import transaction
 from django.db.models import F, OuterRef, Subquery
 from django.http import HttpRequest, JsonResponse
 from django.shortcuts import get_object_or_404
+from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_GET, require_POST
 
 from calls.models import Call, CallResult, CampaignOwnership, ScriptStep, Tenant
+from calls.retries import schedule_retry
 
 HISTORY_SIZE = 20
 
@@ -61,7 +63,11 @@ def tenant_config(request: HttpRequest, tenant_id: int) -> JsonResponse:
 @csrf_exempt
 @require_POST
 def call_result(request: HttpRequest, call_id: uuid.UUID) -> JsonResponse:
-    """Store the outcome of a call and bill its minutes to the tenant."""
+    """Store the outcome of a call, bill its minutes and schedule a retry if nobody answered.
+
+    The runtime retries when it gets no answer, so an identical repeated request answers 200
+    without doing anything again. A different result for a call that already has one is a 409.
+    """
     try:
         payload = parse_result(request.body)
     except ValueError as exc:
@@ -82,16 +88,24 @@ def call_result(request: HttpRequest, call_id: uuid.UUID) -> JsonResponse:
         call.status = Call.Status.FINISHED
         call.save(update_fields=['status'])
 
-        tenant_id = call.campaign.ownerships.get().tenant_id
-
-        Tenant.objects.filter(pk=tenant_id).update(
-            minutes_used=F('minutes_used') + math.ceil(payload['duration_s'] / 60)
+        tenant = Tenant.objects.get(ownerships__campaign_id=call.campaign_id)
+        # Added by the database, so results of the same tenant never overwrite each other.
+        Tenant.objects.filter(pk=tenant.pk).update(
+            minutes_used=F('minutes_used') + billed_minutes(payload)
         )
+        if payload['outcome'] == CallResult.Outcome.NO_ANSWER:
+            schedule_retry(call, tenant, timezone.now())
 
         return JsonResponse({'status': 'ok'})
 
 def is_same_result(result: CallResult, payload: dict[str, Any]) -> bool:
     return all(getattr(result, field) == value for field, value in payload.items())
+
+def billed_minutes(payload: dict[str, Any]) -> int:
+    """Calls nobody answered are not billed."""
+    if payload['outcome'] == CallResult.Outcome.NO_ANSWER:
+        return 0
+    return math.ceil(payload['duration_s'] / 60)
 
 def parse_result(body: bytes) -> dict[str, Any]:
     data = json.loads(body)
